@@ -1,0 +1,718 @@
+import { StockDomainError } from "../core/errors.js";
+import { convertQuantityToPrimary, validateSecondaryDefinition } from "../core/stock-conversion.js";
+import { StockEngine } from "../core/stock-engine.js";
+export const STOCK_UNITS = [
+    "piece", "ml", "m2", "m3", "kg", "litre", "sac", "boite", "rouleau", "palette",
+];
+export const DEFAULT_STOCK_FAMILIES = [
+    "materiaux", "fournitures", "consommables", "outillage",
+];
+const EPSILON = 1e-9;
+function text(value) {
+    return String(value ?? "").trim();
+}
+function normalizeSearch(value) {
+    return value
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLocaleLowerCase("fr-FR")
+        .trim();
+}
+export class StockApplicationService {
+    repository;
+    companyId;
+    userId;
+    now;
+    id;
+    engine;
+    constructor(repository, companyId, userId, now = () => new Date().toISOString(), id = () => crypto.randomUUID()) {
+        this.repository = repository;
+        this.companyId = companyId;
+        this.userId = userId;
+        this.now = now;
+        this.id = id;
+        this.engine = new StockEngine(repository, now, id);
+    }
+    async initialize() {
+        const locations = await this.repository.listLocations(this.companyId);
+        const existing = locations.find(x => x.active && x.name === "Dépôt principal");
+        if (existing)
+            return existing;
+        return this.createLocation({ name: "Dépôt principal", type: "depot" });
+    }
+    async createLocation(input) {
+        const name = text(input.name);
+        if (!name)
+            throw new StockDomainError("INVALID_LOCATION", "Le nom de l'emplacement est obligatoire.");
+        const locations = await this.repository.listLocations(this.companyId);
+        const duplicate = locations.find(x => x.active && normalizeSearch(x.name) === normalizeSearch(name));
+        if (duplicate)
+            return duplicate;
+        const at = this.now();
+        const location = {
+            id: this.id(),
+            companyId: this.companyId,
+            name,
+            type: input.type,
+            chantierId: input.chantierId ?? null,
+            vehicleId: input.vehicleId ?? null,
+            registration: text(input.registration) || null,
+            sourceModule: text(input.sourceModule) || null,
+            active: true,
+            createdAt: at,
+            updatedAt: at,
+        };
+        await this.repository.saveLocation(location);
+        return location;
+    }
+    async createItem(input) {
+        const name = text(input.name);
+        const family = text(input.family);
+        const initialQuantity = input.initialQuantity ?? 0;
+        if (!name)
+            throw new StockDomainError("INVALID_ITEM", "La désignation est obligatoire.");
+        if (!family)
+            throw new StockDomainError("INVALID_ITEM", "La famille est obligatoire.");
+        if (!STOCK_UNITS.includes(input.unit)) {
+            throw new StockDomainError("INVALID_UNIT", "Unité Stock inconnue.", { unit: input.unit });
+        }
+        if (!Number.isFinite(initialQuantity) || initialQuantity < 0) {
+            throw new StockDomainError("INVALID_QUANTITY", "La quantité initiale doit être positive ou nulle.");
+        }
+        if (input.minimumQuantity !== undefined &&
+            input.minimumQuantity !== null &&
+            (!Number.isFinite(input.minimumQuantity) || input.minimumQuantity < 0)) {
+            throw new StockDomainError("INVALID_QUANTITY", "Le seuil minimum doit être positif ou nul.");
+        }
+        validateSecondaryDefinition(input.unit, input.secondary ?? null);
+        const barcode = text(input.barcode) || null;
+        if (barcode) {
+            const items = await this.repository.listItems(this.companyId);
+            const duplicateBarcode = items.find(item => item.active && text(item.barcode) === barcode);
+            if (duplicateBarcode) {
+                throw new StockDomainError("INVALID_ITEM", "Ce code-barres est déjà associé à un autre article.", { barcode, existingProductId: duplicateBarcode.id });
+            }
+        }
+        const defaultLocation = await this.initialize();
+        const locationId = input.locationId ?? defaultLocation.id;
+        const location = await this.repository.getLocation(this.companyId, locationId);
+        if (!location || !location.active) {
+            throw new StockDomainError("LOCATION_NOT_FOUND", "Emplacement sélectionné introuvable.");
+        }
+        const at = this.now();
+        const item = {
+            id: this.id(),
+            companyId: this.companyId,
+            productId: null,
+            name,
+            family,
+            internalReference: text(input.internalReference) || null,
+            unit: input.unit,
+            minimumQuantity: input.minimumQuantity ?? null,
+            mainLocationId: locationId,
+            supplierReference: text(input.supplierReference) || null,
+            barcode,
+            notes: text(input.notes) || null,
+            section: text(input.section) || null,
+            secondary: input.secondary ?? null,
+            active: true,
+            createdAt: at,
+            updatedAt: at,
+        };
+        await this.repository.saveItem(item);
+        if (initialQuantity > 0) {
+            await this.engine.applyMovement({
+                companyId: this.companyId,
+                productId: item.id,
+                quantity: initialQuantity,
+                unit: item.unit,
+                movementType: "ENTRY",
+                locationToId: locationId,
+                userId: this.userId,
+                sourceModule: "stock_ui",
+                sourceId: item.id,
+                reason: "Stock initial",
+            });
+        }
+        return item;
+    }
+    async recordEntry(input) {
+        const item = await this.requireItem(input.productId);
+        const primaryQuantity = convertQuantityToPrimary(item, input.quantity, input.unit);
+        return this.engine.applyMovement({
+            companyId: this.companyId,
+            productId: item.id,
+            quantity: primaryQuantity,
+            unit: item.unit,
+            movementType: "ENTRY",
+            locationToId: input.locationId,
+            chantierId: input.chantierId ?? null,
+            crewId: input.crewId ?? null,
+            userId: this.userId,
+            sourceModule: "stock_ui",
+            sourceId: item.id,
+            reason: text(input.reason) || null,
+        });
+    }
+    async recordExit(input) {
+        return this.recordOutgoingMovement("EXIT", input);
+    }
+    async recordLoss(input) {
+        return this.recordOutgoingMovement("LOSS", input);
+    }
+    async recordBreakage(input) {
+        return this.recordOutgoingMovement("BREAKAGE", input);
+    }
+    async recordSiteReturn(input) {
+        const item = await this.requireItem(input.productId);
+        const primaryQuantity = convertQuantityToPrimary(item, input.quantity, input.unit);
+        return this.engine.applyMovement({
+            companyId: this.companyId,
+            productId: item.id,
+            quantity: primaryQuantity,
+            unit: item.unit,
+            movementType: "SITE_RETURN",
+            locationToId: input.locationId,
+            chantierId: input.chantierId ?? null,
+            userId: this.userId,
+            sourceModule: "stock_ui",
+            sourceId: item.id,
+            reason: text(input.reason) || "Retour chantier",
+        });
+    }
+    async transferStock(input) {
+        const item = await this.requireItem(input.productId);
+        const primaryQuantity = convertQuantityToPrimary(item, input.quantity, input.unit);
+        if (input.fromLocationId === input.toLocationId) {
+            throw new StockDomainError("INVALID_MOVEMENT", "Le départ et l'arrivée doivent être différents.");
+        }
+        return this.engine.applyMovement({
+            companyId: this.companyId,
+            productId: item.id,
+            quantity: primaryQuantity,
+            unit: item.unit,
+            movementType: "TRANSFER",
+            locationFromId: input.fromLocationId,
+            locationToId: input.toLocationId,
+            chantierId: input.chantierId ?? null,
+            userId: this.userId,
+            sourceModule: "stock_ui",
+            sourceId: item.id,
+            reason: text(input.reason) || "Transfert",
+        });
+    }
+    async createReservation(input) {
+        const item = await this.requireItem(input.productId);
+        const chantierId = text(input.chantierId);
+        if (!chantierId) {
+            throw new StockDomainError("VALIDATION_REQUIRED", "Le chantier est obligatoire pour réserver du stock.");
+        }
+        const primaryQuantity = convertQuantityToPrimary(item, input.quantity, input.unit);
+        return this.engine.reserve({
+            companyId: this.companyId,
+            productId: item.id,
+            quantity: primaryQuantity,
+            unit: item.unit,
+            locationId: input.locationId,
+            chantierId,
+            userId: this.userId,
+            sourceModule: "stock_ui",
+            sourceId: chantierId,
+            reason: text(input.reason) || null,
+        });
+    }
+    async releaseReservation(reservationId) {
+        return this.engine.releaseReservation(this.companyId, reservationId);
+    }
+    async listActiveReservations() {
+        const [reservations, items, locations] = await Promise.all([
+            this.repository.listAllReservations(this.companyId),
+            this.repository.listItems(this.companyId),
+            this.repository.listLocations(this.companyId),
+        ]);
+        const itemMap = new Map(items.map(item => [item.id, item]));
+        const locationMap = new Map(locations.map(location => [location.id, location]));
+        return reservations
+            .filter(reservation => reservation.status === "ACTIVE")
+            .map(reservation => {
+            const item = itemMap.get(reservation.productId);
+            if (!item)
+                return null;
+            return {
+                reservation,
+                item,
+                location: reservation.locationId ? locationMap.get(reservation.locationId) ?? null : null,
+            };
+        })
+            .filter((value) => value !== null)
+            .sort((a, b) => b.reservation.createdAt.localeCompare(a.reservation.createdAt));
+    }
+    async createPurchaseRequirement(input) {
+        const item = await this.requireItem(input.productId);
+        if (!Number.isFinite(input.quantity) || input.quantity <= 0) {
+            throw new StockDomainError("INVALID_QUANTITY", "La quantité à réapprovisionner doit être strictement positive.");
+        }
+        const primaryQuantity = convertQuantityToPrimary(item, input.quantity, input.unit);
+        const locationId = input.locationId ?? item.mainLocationId ?? null;
+        if (locationId) {
+            const location = await this.repository.getLocation(this.companyId, locationId);
+            if (!location || !location.active) {
+                throw new StockDomainError("LOCATION_NOT_FOUND", "Emplacement de réapprovisionnement introuvable.");
+            }
+        }
+        const at = this.now();
+        const requirement = {
+            id: this.id(),
+            companyId: this.companyId,
+            productId: item.id,
+            locationId,
+            chantierId: text(input.chantierId) || null,
+            quantity: primaryQuantity,
+            unit: item.unit,
+            status: "DRAFT",
+            reason: text(input.reason) || null,
+            sourceModule: "stock_ui",
+            sourceId: item.id,
+            createdBy: this.userId,
+            createdAt: at,
+            updatedAt: at,
+        };
+        await this.repository.savePurchaseRequirement(requirement);
+        return requirement;
+    }
+    async listPurchaseRequirements() {
+        const [requirements, items, locations] = await Promise.all([
+            this.repository.listPurchaseRequirements(this.companyId),
+            this.repository.listItems(this.companyId),
+            this.repository.listLocations(this.companyId),
+        ]);
+        const itemMap = new Map(items.map(item => [item.id, item]));
+        const locationMap = new Map(locations.map(location => [location.id, location]));
+        return requirements
+            .map(requirement => {
+            const item = itemMap.get(requirement.productId);
+            if (!item)
+                return null;
+            return {
+                requirement,
+                item,
+                location: requirement.locationId ? locationMap.get(requirement.locationId) ?? null : null,
+            };
+        })
+            .filter((value) => value !== null)
+            .sort((a, b) => b.requirement.createdAt.localeCompare(a.requirement.createdAt));
+    }
+    async startInventorySession(locationId) {
+        const location = await this.repository.getLocation(this.companyId, locationId);
+        if (!location || !location.active) {
+            throw new StockDomainError("LOCATION_NOT_FOUND", "Emplacement d'inventaire introuvable.");
+        }
+        const existing = (await this.repository.listInventorySessions(this.companyId))
+            .find(session => session.status === "OPEN" && session.locationId === locationId);
+        if (existing)
+            return existing;
+        const items = (await this.repository.listItems(this.companyId)).filter(item => item.active);
+        const counts = await Promise.all(items.map(async (item) => {
+            const snapshot = await this.engine.snapshot(this.companyId, item.id, locationId);
+            return {
+                productId: item.id,
+                locationId,
+                theoreticalQuantity: snapshot.physicalQuantity,
+                countedQuantity: null,
+                unit: item.unit,
+                countedAt: null,
+            };
+        }));
+        const at = this.now();
+        const session = {
+            id: this.id(),
+            companyId: this.companyId,
+            locationId,
+            locationName: location.name,
+            status: "OPEN",
+            counts,
+            createdBy: this.userId,
+            createdAt: at,
+            completedAt: null,
+            validatedAt: null,
+        };
+        await this.repository.saveInventorySession(session);
+        return session;
+    }
+    async listInventorySessions() {
+        return (await this.repository.listInventorySessions(this.companyId))
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    }
+    async getInventorySession(sessionId) {
+        const session = await this.repository.getInventorySession(this.companyId, sessionId);
+        if (!session) {
+            throw new StockDomainError("VALIDATION_REQUIRED", "Session d'inventaire introuvable.", { sessionId });
+        }
+        return session;
+    }
+    async saveInventorySessionCount(sessionId, productId, countedQuantity) {
+        if (!Number.isFinite(countedQuantity) || countedQuantity < 0) {
+            throw new StockDomainError("INVALID_QUANTITY", "La quantité comptée doit être positive ou nulle.");
+        }
+        const session = await this.getInventorySession(sessionId);
+        if (session.status !== "OPEN") {
+            throw new StockDomainError("VALIDATION_REQUIRED", "Cet inventaire n'est plus modifiable.");
+        }
+        const count = session.counts.find(row => row.productId === productId);
+        if (!count) {
+            throw new StockDomainError("PRODUCT_NOT_FOUND", "Article absent du snapshot d'inventaire.", { productId });
+        }
+        count.countedQuantity = countedQuantity;
+        count.countedAt = this.now();
+        await this.repository.saveInventorySession(session);
+        return session;
+    }
+    async completeInventorySession(sessionId) {
+        const session = await this.getInventorySession(sessionId);
+        if (session.status !== "OPEN")
+            return session;
+        const missing = session.counts.filter(row => row.countedQuantity === null);
+        if (missing.length) {
+            throw new StockDomainError("VALIDATION_REQUIRED", `Il reste ${missing.length} article(s) à compter avant de terminer l'inventaire.`, { missingProductIds: missing.map(row => row.productId) });
+        }
+        session.status = "COMPLETED";
+        session.completedAt = this.now();
+        await this.repository.saveInventorySession(session);
+        return session;
+    }
+    async validateInventoryAdjustments(sessionId) {
+        const session = await this.getInventorySession(sessionId);
+        if (session.status !== "COMPLETED") {
+            throw new StockDomainError("VALIDATION_REQUIRED", "L'inventaire doit être terminé avant de corriger le Stock.");
+        }
+        const movements = [];
+        for (const row of session.counts) {
+            if (row.countedQuantity === null)
+                continue;
+            const difference = row.countedQuantity - row.theoreticalQuantity;
+            if (Math.abs(difference) <= EPSILON)
+                continue;
+            const item = await this.requireItem(row.productId);
+            const movement = await this.engine.applyMovement({
+                companyId: this.companyId,
+                productId: item.id,
+                quantity: difference,
+                unit: item.unit,
+                movementType: "ADJUSTMENT",
+                locationFromId: difference < 0 ? session.locationId : null,
+                locationToId: difference > 0 ? session.locationId : null,
+                userId: this.userId,
+                sourceModule: "stock_inventory",
+                sourceId: session.id,
+                reason: `Correction inventaire ${session.locationName} · session ${session.id}`,
+            });
+            movements.push(movement);
+        }
+        session.status = "VALIDATED";
+        session.validatedAt = this.now();
+        await this.repository.saveInventorySession(session);
+        return { session, movements };
+    }
+    async applyInventoryCount(input) {
+        if (!Number.isFinite(input.countedQuantity) || input.countedQuantity < 0) {
+            throw new StockDomainError("INVALID_QUANTITY", "La quantité comptée doit être positive ou nulle.");
+        }
+        const item = await this.requireItem(input.productId);
+        const location = await this.repository.getLocation(this.companyId, input.locationId);
+        if (!location || !location.active) {
+            throw new StockDomainError("LOCATION_NOT_FOUND", "Emplacement d'inventaire introuvable.");
+        }
+        const snapshot = await this.engine.snapshot(this.companyId, item.id, location.id);
+        const difference = input.countedQuantity - snapshot.physicalQuantity;
+        if (Math.abs(difference) <= EPSILON) {
+            return {
+                theoreticalQuantity: snapshot.physicalQuantity,
+                countedQuantity: input.countedQuantity,
+                difference: 0,
+                movement: null,
+            };
+        }
+        const movement = await this.engine.applyMovement({
+            companyId: this.companyId,
+            productId: item.id,
+            quantity: difference,
+            unit: item.unit,
+            movementType: "ADJUSTMENT",
+            locationFromId: difference < 0 ? location.id : null,
+            locationToId: difference > 0 ? location.id : null,
+            userId: this.userId,
+            sourceModule: "stock_inventory",
+            sourceId: item.id,
+            reason: text(input.reason) || `Inventaire ${location.name}`,
+        });
+        return {
+            theoreticalQuantity: snapshot.physicalQuantity,
+            countedQuantity: input.countedQuantity,
+            difference,
+            movement,
+        };
+    }
+    async inventoryRows(locationId, search = "") {
+        const location = await this.repository.getLocation(this.companyId, locationId);
+        if (!location || !location.active) {
+            throw new StockDomainError("LOCATION_NOT_FOUND", "Emplacement d'inventaire introuvable.");
+        }
+        const views = await this.listItemViews(search);
+        const rows = await Promise.all(views.map(async ({ item }) => {
+            const snapshot = await this.engine.snapshot(this.companyId, item.id, location.id);
+            return {
+                item,
+                location,
+                theoreticalQuantity: snapshot.physicalQuantity,
+                reservedQuantity: snapshot.reservedQuantity,
+                availableQuantity: snapshot.availableQuantity,
+            };
+        }));
+        return rows.sort((a, b) => a.item.name.localeCompare(b.item.name, "fr"));
+    }
+    async locationBreakdown(productId) {
+        await this.requireItem(productId);
+        const locations = await this.listLocations();
+        const rows = await Promise.all(locations.map(async (location) => ({
+            location,
+            snapshot: await this.engine.snapshot(this.companyId, productId, location.id),
+        })));
+        return rows
+            .filter(x => Math.abs(x.snapshot.physicalQuantity) > EPSILON || Math.abs(x.snapshot.reservedQuantity) > EPSILON)
+            .sort((a, b) => a.location.name.localeCompare(b.location.name, "fr"));
+    }
+    async listLocations() {
+        const locations = await this.repository.listLocations(this.companyId);
+        return locations.filter(x => x.active).sort((a, b) => a.name.localeCompare(b.name, "fr"));
+    }
+    async createVehicle(input) {
+        const name = text(input.name);
+        if (!name) {
+            throw new StockDomainError("INVALID_LOCATION", "Le nom du véhicule est obligatoire.");
+        }
+        return this.createLocation({
+            name,
+            type: "vehicule",
+            vehicleId: `demo-local:${this.id()}`,
+            registration: text(input.registration) || null,
+            sourceModule: "stock_demo",
+        });
+    }
+    async syncVehicleFromParcMateriel(input) {
+        const vehicleId = text(input.vehicleId);
+        const name = text(input.name);
+        if (!vehicleId || !name) {
+            throw new StockDomainError("INVALID_LOCATION", "vehicleId et nom sont obligatoires pour synchroniser un véhicule.");
+        }
+        const locations = await this.repository.listLocations(this.companyId);
+        const existing = locations.find(location => location.type === "vehicule" && location.vehicleId === vehicleId);
+        const at = this.now();
+        const location = existing
+            ? {
+                ...existing,
+                name,
+                registration: text(input.registration) || null,
+                sourceModule: text(input.sourceModule) || "parc_materiel",
+                active: input.active,
+                updatedAt: at,
+            }
+            : {
+                id: this.id(),
+                companyId: this.companyId,
+                name,
+                type: "vehicule",
+                chantierId: null,
+                vehicleId,
+                registration: text(input.registration) || null,
+                sourceModule: text(input.sourceModule) || "parc_materiel",
+                active: input.active,
+                createdAt: at,
+                updatedAt: at,
+            };
+        await this.repository.saveLocation(location);
+        return location;
+    }
+    async listVehicleStocks() {
+        const [locations, items] = await Promise.all([
+            this.listLocations(),
+            this.repository.listItems(this.companyId),
+        ]);
+        const vehicles = locations.filter(location => location.type === "vehicule" && location.active);
+        const views = await Promise.all(vehicles.map(async (location) => {
+            const lines = (await Promise.all(items
+                .filter(item => item.active)
+                .map(async (item) => ({
+                item,
+                snapshot: await this.engine.snapshot(this.companyId, item.id, location.id),
+            }))))
+                .filter(line => Math.abs(line.snapshot.physicalQuantity) > EPSILON || Math.abs(line.snapshot.reservedQuantity) > EPSILON)
+                .sort((a, b) => a.item.name.localeCompare(b.item.name, "fr"));
+            return {
+                location,
+                registration: location.registration ?? (location.sourceModule === "stock_demo" ? null : location.vehicleId ?? null),
+                referenceCount: lines.filter(line => line.snapshot.physicalQuantity > EPSILON).length,
+                reservedReferenceCount: lines.filter(line => line.snapshot.reservedQuantity > EPSILON).length,
+                lines,
+            };
+        }));
+        return views.sort((a, b) => a.location.name.localeCompare(b.location.name, "fr"));
+    }
+    async findItemByBarcode(rawCode) {
+        const code = text(rawCode);
+        if (!code)
+            return null;
+        const items = await this.repository.listItems(this.companyId);
+        return items.find(item => item.active && text(item.barcode) === code) ?? null;
+    }
+    async getItemView(productId) {
+        const item = await this.requireItem(productId);
+        return {
+            item,
+            snapshot: await this.engine.snapshot(this.companyId, item.id, null),
+            mainLocation: item.mainLocationId
+                ? await this.repository.getLocation(this.companyId, item.mainLocationId)
+                : null,
+        };
+    }
+    async getLocation(locationId) {
+        const location = await this.repository.getLocation(this.companyId, locationId);
+        if (!location || !location.active) {
+            throw new StockDomainError("LOCATION_NOT_FOUND", "Emplacement Stock introuvable.", { locationId });
+        }
+        return location;
+    }
+    async listItemViews(search = "") {
+        const all = (await this.repository.listItems(this.companyId)).filter(x => x.active);
+        const needle = normalizeSearch(search);
+        const filtered = needle
+            ? all.filter(item => normalizeSearch([
+                item.name,
+                item.internalReference,
+                item.family,
+                item.section,
+                item.supplierReference,
+                item.barcode,
+            ].filter(Boolean).join(" ")).includes(needle))
+            : all;
+        const views = await Promise.all(filtered.map(async (item) => ({
+            item,
+            snapshot: await this.engine.snapshot(this.companyId, item.id, null),
+            mainLocation: item.mainLocationId
+                ? await this.repository.getLocation(this.companyId, item.mainLocationId)
+                : null,
+        })));
+        return views.sort((a, b) => a.item.name.localeCompare(b.item.name, "fr"));
+    }
+    async movementHistory(limit = 100) {
+        const [movements, items, locations] = await Promise.all([
+            this.repository.listAllMovements(this.companyId),
+            this.repository.listItems(this.companyId),
+            this.repository.listLocations(this.companyId),
+        ]);
+        const itemNames = new Map(items.map(x => [x.id, x.name]));
+        const locationNames = new Map(locations.map(x => [x.id, x.name]));
+        return movements
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+            .slice(0, limit)
+            .map(movement => ({
+            movement,
+            itemName: itemNames.get(movement.productId) ?? "Article inconnu",
+            locationFromName: movement.locationFromId ? locationNames.get(movement.locationFromId) ?? "Emplacement inconnu" : null,
+            locationToName: movement.locationToId ? locationNames.get(movement.locationToId) ?? "Emplacement inconnu" : null,
+        }));
+    }
+    async listAlerts() {
+        const [views, movements] = await Promise.all([
+            this.listItemViews(),
+            this.repository.listAllMovements(this.companyId),
+        ]);
+        const current = views
+            .filter(view => view.snapshot.status === "LOW_STOCK" || view.snapshot.status === "OUT_OF_STOCK")
+            .map(view => {
+            const type = view.snapshot.status === "OUT_OF_STOCK" ? "OUT_OF_STOCK" : "LOW_STOCK";
+            return {
+                id: `${type}:${view.item.id}`,
+                type,
+                item: view.item,
+                quantity: view.snapshot.availableQuantity,
+                threshold: view.item.minimumQuantity,
+                movementId: null,
+                createdAt: this.now(),
+                message: type === "OUT_OF_STOCK"
+                    ? "Article en rupture."
+                    : `Stock disponible sous le seuil minimum${view.item.minimumQuantity === null ? "" : ` de ${view.item.minimumQuantity}`}.`,
+            };
+        });
+        const itemMap = new Map(views.map(view => [view.item.id, view.item]));
+        const inventory = movements
+            .filter(movement => movement.movementType === "ADJUSTMENT" && movement.sourceModule === "stock_inventory")
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+            .slice(0, 10)
+            .reduce((alerts, movement) => {
+            const item = itemMap.get(movement.productId);
+            if (!item)
+                return alerts;
+            alerts.push({
+                id: `INVENTORY_DIFFERENCE:${movement.id}`,
+                type: "INVENTORY_DIFFERENCE",
+                item,
+                quantity: movement.quantity,
+                threshold: item.minimumQuantity,
+                movementId: movement.id,
+                createdAt: movement.createdAt,
+                message: `Écart d'inventaire corrigé de ${movement.quantity > 0 ? "+" : ""}${movement.quantity} ${item.unit}.`,
+            });
+            return alerts;
+        }, []);
+        const order = {
+            OUT_OF_STOCK: 0,
+            LOW_STOCK: 1,
+            INVENTORY_DIFFERENCE: 2,
+        };
+        return [...current, ...inventory].sort((a, b) => {
+            const typeOrder = order[a.type] - order[b.type];
+            return typeOrder !== 0 ? typeOrder : b.createdAt.localeCompare(a.createdAt);
+        });
+    }
+    async dashboard() {
+        const [views, movements, reservations, requirements] = await Promise.all([
+            this.listItemViews(),
+            this.repository.listAllMovements(this.companyId),
+            this.repository.listAllReservations(this.companyId),
+            this.repository.listPurchaseRequirements(this.companyId),
+        ]);
+        return {
+            articleCount: views.length,
+            lowStockCount: views.filter(x => x.snapshot.status === "LOW_STOCK").length,
+            outOfStockCount: views.filter(x => x.snapshot.status === "OUT_OF_STOCK").length,
+            movementCount: movements.length,
+            activeReservationCount: reservations.filter(x => x.status === "ACTIVE").length,
+            purchaseRequirementCount: requirements.filter(x => x.status === "DRAFT").length,
+        };
+    }
+    async recordOutgoingMovement(movementType, input) {
+        const item = await this.requireItem(input.productId);
+        const primaryQuantity = convertQuantityToPrimary(item, input.quantity, input.unit);
+        return this.engine.applyMovement({
+            companyId: this.companyId,
+            productId: item.id,
+            quantity: primaryQuantity,
+            unit: item.unit,
+            movementType,
+            locationFromId: input.locationId,
+            chantierId: input.chantierId ?? null,
+            crewId: input.crewId ?? null,
+            userId: this.userId,
+            sourceModule: "stock_ui",
+            sourceId: item.id,
+            reason: text(input.reason) || null,
+        });
+    }
+    async requireItem(productId) {
+        const item = await this.repository.getItem(this.companyId, productId);
+        if (!item || !item.active) {
+            throw new StockDomainError("PRODUCT_NOT_FOUND", "Article Stock introuvable.", { productId });
+        }
+        return item;
+    }
+}

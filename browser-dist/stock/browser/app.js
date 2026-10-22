@@ -1,0 +1,1551 @@
+import { StockApplicationService } from "../application/stock-application-service.js";
+import { AngelSupplierSearchService } from "../angele/supplier-search.js";
+import { StockDomainError } from "../core/errors.js";
+import { secondaryQuantityView } from "../core/stock-conversion.js";
+import { loadBtpDemoData } from "../demo/demo-data.js";
+import { LocalStorageStockRepository } from "../repositories/local-storage-stock-repository.js";
+import { StockExpertScanService } from "../expert/scan-service.js";
+import { GenericSupplierDemoAdapter, IdeaBoisDemoAdapter } from "../suppliers/demo-adapters.js";
+import { SupplierStockService } from "../suppliers/supplier-service.js";
+import { StockReferenceDirectory } from "../integrations/reference-directory.js";
+const COMPANY_ID = "demo-company";
+const USER_ID = "demo-user";
+const repository = new LocalStorageStockRepository(window.localStorage);
+const service = new StockApplicationService(repository, COMPANY_ID, USER_ID);
+const supplierService = new SupplierStockService();
+supplierService.register(new IdeaBoisDemoAdapter());
+supplierService.register(new GenericSupplierDemoAdapter());
+const angelSupplierService = new AngelSupplierSearchService(supplierService);
+const expertScanService = new StockExpertScanService(service);
+const referenceDirectory = new StockReferenceDirectory();
+referenceDirectory.applyCrewSnapshot({ crewId: "crew-demo-couvreurs", name: "Équipe couvreurs — démo connecteur", active: true });
+referenceDirectory.applyCrewSnapshot({ crewId: "crew-demo-polyvalente", name: "Équipe polyvalente — démo connecteur", active: true });
+referenceDirectory.applyChantierSnapshot({ chantierId: "chantier-demo-dupont", name: "Chantier Dupont — démo connecteur", active: true });
+referenceDirectory.applyChantierSnapshot({ chantierId: "chantier-demo-renovation", name: "Rénovation toiture — démo connecteur", active: true });
+const $ = (selector) => {
+    const element = document.querySelector(selector);
+    if (!element)
+        throw new Error(`Élément DOM introuvable : ${selector}`);
+    return element;
+};
+const UNIT_LABELS = {
+    piece: "pièce", ml: "ml", m2: "m²", m3: "m³", kg: "kg", litre: "L",
+    sac: "sac", boite: "boîte", rouleau: "rouleau", palette: "palette",
+};
+const MOVEMENT_LABELS = {
+    ENTRY: "Entrée", EXIT: "Sortie", TRANSFER: "Transfert", ADJUSTMENT: "Ajustement",
+    LOSS: "Perte", BREAKAGE: "Casse", SITE_RETURN: "Retour chantier",
+};
+const STOCK_NAME_SUGGESTIONS = [
+    "Chevron",
+    "Lambourde",
+    "Liteau",
+    "Bastaing",
+    "Madrier",
+    "Solive",
+    "Planche",
+    "Volige",
+    "Panneau OSB",
+    "Plaque de plâtre",
+    "Vis bois",
+    "Vis placo",
+    "Cheville",
+    "Mortier",
+    "Ciment",
+    "Sable",
+    "Gravier",
+    "Tuile",
+    "Ardoise",
+    "Membrane",
+    "Isolant",
+    "Mastic",
+    "Colle",
+];
+let search = "";
+let supplierSearch = "";
+let lastSupplierDraft = null;
+let currentScanDraft = null;
+let currentInventorySessionId = null;
+let expertCameraStream = null;
+let expertCameraFrame = 0;
+let toastTimer = null;
+function quantity(value) {
+    return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 3 }).format(value);
+}
+function unitLabel(unit, value = 2) {
+    const singular = UNIT_LABELS[unit];
+    if (Math.abs(value) === 1)
+        return singular;
+    if (unit === "piece")
+        return "pièces";
+    if (unit === "boite")
+        return "boîtes";
+    if (unit === "sac")
+        return "sacs";
+    if (unit === "rouleau")
+        return "rouleaux";
+    if (unit === "palette")
+        return "palettes";
+    return singular;
+}
+function stockQuantityLines(item, primaryQuantity) {
+    const secondary = secondaryQuantityView(item, primaryQuantity);
+    if (!secondary) {
+        return { main: `${quantity(primaryQuantity)} ${unitLabel(item.unit, primaryQuantity)}`, secondary: null };
+    }
+    const packagingUnits = ["boite", "sac", "rouleau", "palette"];
+    const hasRemainder = secondary.secondaryRemainder > 1e-6;
+    const main = packagingUnits.includes(item.unit) && hasRemainder
+        ? `${secondary.fullPrimaryUnits} ${unitLabel(item.unit, secondary.fullPrimaryUnits)} complètes + ${quantity(secondary.secondaryRemainder)} ${unitLabel(secondary.unit, secondary.secondaryRemainder)}`
+        : `${quantity(primaryQuantity)} ${unitLabel(item.unit, primaryQuantity)}`;
+    return {
+        main,
+        secondary: `${quantity(secondary.quantity)} ${unitLabel(secondary.unit, secondary.quantity)} au total`,
+    };
+}
+function setUnitOptions(select, item) {
+    const options = [{ value: item.unit, label: unitLabel(item.unit) }];
+    if (item.secondary) {
+        options.push({ value: item.secondary.secondaryUnit, label: unitLabel(item.secondary.secondaryUnit) });
+    }
+    select.innerHTML = options.map(option => `<option value="${option.value}">${option.label}</option>`).join("");
+    select.value = item.unit;
+}
+function secondaryDefinitionFromForm(data) {
+    const mode = String(data.get("secondaryMode") ?? "none");
+    const primaryUnit = String(data.get("unit") ?? "piece");
+    if (mode === "none")
+        return null;
+    if (mode === "manual") {
+        return {
+            mode: "manual",
+            secondaryUnit: String(data.get("secondaryUnit") ?? "piece"),
+            quantityPerPrimaryUnit: Number(data.get("secondaryPerPrimary") ?? 0),
+        };
+    }
+    const lengthM = Number(data.get(mode === "length" ? "lengthOnlyM" : mode === "area" ? "areaLengthM" : "volumeLengthM") ?? 0);
+    const lengthMm = lengthM * 1000;
+    if (mode === "length") {
+        if (primaryUnit === "ml") {
+            return {
+                mode: "equivalence",
+                secondaryUnit: "piece",
+                primaryQuantityPerSecondaryUnit: lengthM,
+            };
+        }
+        return { mode: "length", secondaryUnit: "ml", lengthMm };
+    }
+    const widthM = Number(data.get(mode === "area" ? "areaWidthM" : "volumeWidthM") ?? 0);
+    const widthMm = widthM * 1000;
+    if (mode === "area") {
+        const areaM2 = lengthM * widthM;
+        if (primaryUnit === "m2") {
+            return {
+                mode: "equivalence",
+                secondaryUnit: "piece",
+                primaryQuantityPerSecondaryUnit: areaM2,
+            };
+        }
+        return { mode: "area", secondaryUnit: "m2", lengthMm, widthMm };
+    }
+    const thicknessMm = Number(data.get("thicknessMm") ?? 0);
+    const volumeM3 = lengthM * widthM * (thicknessMm / 1000);
+    if (primaryUnit === "m3") {
+        return {
+            mode: "equivalence",
+            secondaryUnit: "piece",
+            primaryQuantityPerSecondaryUnit: volumeM3,
+        };
+    }
+    return { mode: "volume", secondaryUnit: "m3", lengthMm, widthMm, thicknessMm };
+}
+function normalizeSuggestion(value) {
+    return value
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLocaleLowerCase("fr-FR")
+        .trim();
+}
+function clearItemFormErrors(form) {
+    form.querySelectorAll(".field-invalid").forEach(field => {
+        field.classList.remove("field-invalid");
+        field.removeAttribute("aria-invalid");
+    });
+    form.querySelectorAll(".field-error-message").forEach(message => message.remove());
+    const summary = $("#item-form-error");
+    summary.hidden = true;
+    summary.textContent = "";
+}
+function setItemFieldError(form, name, message) {
+    const field = form.elements.namedItem(name);
+    if (!field)
+        return;
+    field.classList.add("field-invalid");
+    field.setAttribute("aria-invalid", "true");
+    const error = document.createElement("span");
+    error.className = "field-error-message";
+    error.textContent = message;
+    field.insertAdjacentElement("afterend", error);
+}
+function showItemFormError(message) {
+    const summary = $("#item-form-error");
+    summary.textContent = message;
+    summary.hidden = false;
+}
+function validateItemForm(form) {
+    clearItemFormErrors(form);
+    const data = new FormData(form);
+    const errors = [];
+    const value = (name) => String(data.get(name) ?? "").trim();
+    const number = (name) => Number(data.get(name) ?? NaN);
+    if (!value("name"))
+        errors.push({ name: "name", message: "Renseignez la désignation de l'article." });
+    if (!value("family"))
+        errors.push({ name: "family", message: "Choisissez une famille." });
+    if (!value("unit"))
+        errors.push({ name: "unit", message: "Choisissez l'unité de stock." });
+    if (!value("locationId"))
+        errors.push({ name: "locationId", message: "Choisissez un emplacement." });
+    const initial = number("initialQuantity");
+    if (!Number.isFinite(initial) || initial < 0) {
+        errors.push({ name: "initialQuantity", message: "La quantité initiale doit être positive ou nulle." });
+    }
+    const minimumRaw = value("minimumQuantity");
+    if (minimumRaw && (!Number.isFinite(number("minimumQuantity")) || number("minimumQuantity") < 0)) {
+        errors.push({ name: "minimumQuantity", message: "L'alerte stock minimum doit être positive ou nulle." });
+    }
+    const mode = value("secondaryMode");
+    if (mode === "length" && (!Number.isFinite(number("lengthOnlyM")) || number("lengthOnlyM") <= 0)) {
+        errors.push({ name: "lengthOnlyM", message: "Renseignez la longueur d'une unité." });
+    }
+    if (mode === "area") {
+        if (!Number.isFinite(number("areaLengthM")) || number("areaLengthM") <= 0) {
+            errors.push({ name: "areaLengthM", message: "Renseignez la longueur." });
+        }
+        if (!Number.isFinite(number("areaWidthM")) || number("areaWidthM") <= 0) {
+            errors.push({ name: "areaWidthM", message: "Renseignez la largeur." });
+        }
+    }
+    if (mode === "volume") {
+        if (!Number.isFinite(number("volumeLengthM")) || number("volumeLengthM") <= 0) {
+            errors.push({ name: "volumeLengthM", message: "Renseignez la longueur." });
+        }
+        if (!Number.isFinite(number("volumeWidthM")) || number("volumeWidthM") <= 0) {
+            errors.push({ name: "volumeWidthM", message: "Renseignez la largeur." });
+        }
+        if (!Number.isFinite(number("thicknessMm")) || number("thicknessMm") <= 0) {
+            errors.push({ name: "thicknessMm", message: "Renseignez l'épaisseur." });
+        }
+    }
+    if (mode === "manual") {
+        if (!Number.isFinite(number("secondaryPerPrimary")) || number("secondaryPerPrimary") <= 0) {
+            errors.push({ name: "secondaryPerPrimary", message: "Renseignez le contenu par unité de stock." });
+        }
+        if (value("secondaryUnit") === value("unit")) {
+            errors.push({ name: "secondaryUnit", message: "L'unité équivalente doit être différente de l'unité de stock." });
+        }
+    }
+    for (const error of errors)
+        setItemFieldError(form, error.name, error.message);
+    if (errors.length) {
+        showItemFormError("Certaines informations sont manquantes ou incorrectes. Les champs concernés sont surlignés en rouge.");
+        const first = form.querySelector(".field-invalid");
+        first?.focus();
+        return false;
+    }
+    return true;
+}
+function mapItemDomainError(form, error) {
+    clearItemFormErrors(form);
+    const message = explainError(error);
+    if (error instanceof StockDomainError) {
+        if (error.code === "LOCATION_NOT_FOUND")
+            setItemFieldError(form, "locationId", message);
+        else if (error.code === "INVALID_UNIT")
+            setItemFieldError(form, "secondaryMode", message);
+        else if (error.code === "INVALID_QUANTITY")
+            setItemFieldError(form, "initialQuantity", message);
+        else if (error.code === "INVALID_ITEM" && "barcode" in error.details)
+            setItemFieldError(form, "barcode", message);
+        else if (error.code === "INVALID_ITEM")
+            setItemFieldError(form, "name", message);
+    }
+    showItemFormError(message);
+}
+function updateConditionPreview(form) {
+    const preview = $("#condition-preview");
+    const data = new FormData(form);
+    const mode = String(data.get("secondaryMode") ?? "none");
+    if (mode === "none") {
+        preview.hidden = true;
+        preview.textContent = "";
+        return;
+    }
+    const initialQuantity = Number(data.get("initialQuantity") ?? 0);
+    if (!Number.isFinite(initialQuantity) || initialQuantity < 0) {
+        preview.hidden = true;
+        return;
+    }
+    try {
+        const definition = secondaryDefinitionFromForm(data);
+        if (!definition) {
+            preview.hidden = true;
+            return;
+        }
+        const primaryUnit = String(data.get("unit") ?? "piece");
+        const pseudoItem = {
+            id: "preview",
+            companyId: "preview",
+            productId: null,
+            name: "Aperçu",
+            family: "materiaux",
+            internalReference: null,
+            unit: primaryUnit,
+            minimumQuantity: null,
+            mainLocationId: null,
+            secondary: definition,
+            active: true,
+            createdAt: "",
+            updatedAt: "",
+        };
+        const converted = secondaryQuantityView(pseudoItem, initialQuantity);
+        if (!converted || !Number.isFinite(converted.quantity)) {
+            preview.hidden = true;
+            return;
+        }
+        preview.hidden = false;
+        preview.innerHTML = `<strong>Équivalence calculée</strong><span>${quantity(initialQuantity)} ${unitLabel(primaryUnit, initialQuantity)} = ${quantity(converted.quantity)} ${unitLabel(converted.unit, converted.quantity)}</span>`;
+    }
+    catch {
+        preview.hidden = true;
+    }
+}
+async function renderNameSuggestions(raw) {
+    const box = $("#item-name-suggestions");
+    const needle = normalizeSuggestion(raw);
+    if (needle.length < 2) {
+        box.hidden = true;
+        box.innerHTML = "";
+        return;
+    }
+    const existing = (await service.listItemViews()).map(view => view.item.name);
+    const all = [...new Set([...STOCK_NAME_SUGGESTIONS, ...existing])];
+    const matches = all
+        .filter(name => normalizeSuggestion(name).includes(needle))
+        .sort((a, b) => {
+        const aa = normalizeSuggestion(a).startsWith(needle) ? 0 : 1;
+        const bb = normalizeSuggestion(b).startsWith(needle) ? 0 : 1;
+        return aa - bb || a.localeCompare(b, "fr");
+    })
+        .slice(0, 6);
+    if (!matches.length) {
+        box.hidden = true;
+        box.innerHTML = "";
+        return;
+    }
+    box.innerHTML = matches.map(name => `<button type="button" data-name-suggestion="${escapeHtml(name)}">${escapeHtml(name)}</button>`).join("");
+    box.hidden = false;
+    box.querySelectorAll("[data-name-suggestion]").forEach(button => {
+        button.addEventListener("click", () => {
+            const input = $("#item-name-input");
+            input.value = button.dataset.nameSuggestion ?? "";
+            box.hidden = true;
+            input.focus();
+        });
+    });
+}
+function dateLabel(value) {
+    return new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
+}
+function escapeHtml(value) {
+    const div = document.createElement("div");
+    div.textContent = value;
+    return div.innerHTML;
+}
+function showToast(message, error = false) {
+    const toast = $("#toast");
+    toast.textContent = message;
+    toast.classList.toggle("error", error);
+    toast.classList.add("show");
+    if (toastTimer !== null)
+        window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => toast.classList.remove("show"), 3200);
+}
+function explainError(error) {
+    if (error instanceof StockDomainError) {
+        if (error.code === "STOCK_INSUFFICIENT") {
+            const available = Number(error.details.availableQuantity ?? 0);
+            return `Stock insuffisant. Disponible : ${quantity(available)}.`;
+        }
+        return error.message;
+    }
+    return error instanceof Error ? error.message : "Une erreur est survenue.";
+}
+function locationTypeLabel(type) {
+    return ({ depot: "Dépôt", atelier: "Atelier", vehicule: "Véhicule", chantier: "Chantier", autre: "Autre" })[type];
+}
+function statusBadge(status) {
+    if (status === "OUT_OF_STOCK")
+        return `<span class="badge out">Rupture</span>`;
+    if (status === "LOW_STOCK")
+        return `<span class="badge low">Stock faible</span>`;
+    return `<span class="badge good">Disponible</span>`;
+}
+function supplierStatus(status) {
+    return ({
+        AVAILABLE: { label: "Disponible", css: "good" },
+        LOW_STOCK: { label: "Stock faible", css: "low" },
+        OUT_OF_STOCK: { label: "Rupture", css: "out" },
+        ON_ORDER: { label: "Sur commande", css: "info" },
+        UNKNOWN: { label: "Inconnu", css: "neutral" },
+    })[status];
+}
+function supplierFreshness(row) {
+    if (row.freshness === "FRESH")
+        return row.ageMinutes === 0 ? "Synchronisé à l'instant" : `Synchronisé il y a ${row.ageMinutes} min`;
+    if (row.freshness === "STALE")
+        return `Donnée périmée · ${row.ageMinutes ?? "?"} min`;
+    return "Date de synchronisation inconnue";
+}
+function euro(value) {
+    return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
+}
+function renderSupplierDraft() {
+    const box = $("#supplier-draft");
+    if (!lastSupplierDraft) {
+        box.innerHTML = "";
+        box.hidden = true;
+        return;
+    }
+    box.hidden = false;
+    box.innerHTML = `
+    <div>
+      <strong>${lastSupplierDraft.type === "ORDER_REQUEST" ? "Brouillon de commande préparé" : "Demande de devis préparée"}</strong>
+      <span>${escapeHtml(lastSupplierDraft.supplierName)} · ${escapeHtml(lastSupplierDraft.designation)} · ${quantity(lastSupplierDraft.quantity)} ${unitLabel(lastSupplierDraft.unit, lastSupplierDraft.quantity)}</span>
+    </div>
+    <span class="badge info">Validation humaine obligatoire</span>
+  `;
+}
+async function fillLocationSelects() {
+    const locations = await service.listLocations();
+    const options = locations.map(l => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.name)}</option>`).join("");
+    for (const id of ["item-location-select", "movement-location-select", "transfer-from-select", "transfer-to-select", "incident-location-select", "inventory-location-select", "reservation-location-select", "replenish-location-select"]) {
+        const el = document.getElementById(id);
+        if (el)
+            el.innerHTML = options;
+    }
+}
+async function fillConnectedReferenceSelects() {
+    const crews = referenceDirectory.listCrews();
+    const chantiers = referenceDirectory.listChantiers();
+    const crewSelect = document.getElementById("movement-crew-select");
+    if (crewSelect) {
+        crewSelect.innerHTML = crews.length
+            ? crews.map(crew => `<option value="${escapeHtml(crew.crewId)}">${escapeHtml(crew.name)}</option>`).join("")
+            : `<option value="">Aucune équipe reçue</option>`;
+    }
+    const chantierSelect = document.getElementById("movement-chantier-select");
+    if (chantierSelect) {
+        chantierSelect.innerHTML = chantiers.length
+            ? chantiers.map(chantier => `<option value="${escapeHtml(chantier.chantierId)}">${escapeHtml(chantier.name)}</option>`).join("")
+            : `<option value="">Aucun chantier reçu</option>`;
+    }
+}
+async function renderDashboard() {
+    const summary = await service.dashboard();
+    $("#stat-articles").textContent = String(summary.articleCount);
+    $("#stat-low").textContent = String(summary.lowStockCount);
+    $("#stat-out").textContent = String(summary.outOfStockCount);
+    $("#stat-movements").textContent = String(summary.movementCount);
+    $("#stat-reservations").textContent = String(summary.activeReservationCount);
+    $("#stat-replenish").textContent = String(summary.purchaseRequirementCount);
+    const demoButton = document.getElementById("load-demo-button");
+    if (demoButton)
+        demoButton.hidden = summary.articleCount > 0;
+}
+async function renderStock() {
+    const views = await service.listItemViews(search);
+    const list = $("#stock-list");
+    if (!views.length) {
+        list.innerHTML = `<div class="empty"><strong>${search ? "Aucun article trouvé" : "Votre stock est vide"}</strong><span>${search ? "Essayez une autre recherche." : "Ajoutez votre premier article pour commencer."}</span></div>`;
+        return;
+    }
+    const blocks = await Promise.all(views.map(async ({ item, snapshot, mainLocation }) => {
+        const breakdown = await service.locationBreakdown(item.id);
+        const locations = breakdown.length
+            ? `<div class="location-breakdown">${breakdown.map(row => {
+                const local = stockQuantityLines(item, row.snapshot.physicalQuantity);
+                return `<span><strong>${escapeHtml(row.location.name)}</strong> ${escapeHtml(local.main)}${local.secondary ? ` · ${escapeHtml(local.secondary)}` : ""}</span>`;
+            }).join("")}</div>`
+            : `<div class="location-breakdown"><span>Aucune quantité physique localisée.</span></div>`;
+        const availableDisplay = stockQuantityLines(item, snapshot.availableQuantity);
+        const physicalDisplay = stockQuantityLines(item, snapshot.physicalQuantity);
+        const reservedDisplay = stockQuantityLines(item, snapshot.reservedQuantity);
+        return `
+      <article class="stock-card" data-product-id="${escapeHtml(item.id)}">
+        <div>
+          <div class="stock-title"><h3>${escapeHtml(item.name)}</h3>${statusBadge(snapshot.status)}</div>
+          <div class="stock-meta">
+            <span>${escapeHtml(item.family)}</span>
+            ${item.section ? `<span>Section : ${escapeHtml(item.section)}</span>` : ""}
+            ${item.internalReference ? `<span>Réf. ${escapeHtml(item.internalReference)}</span>` : ""}
+            <span>Principal : ${escapeHtml(mainLocation?.name ?? "Sans emplacement")}</span>
+            ${item.minimumQuantity !== null ? `<span>Alerte mini : ${quantity(item.minimumQuantity)} ${UNIT_LABELS[item.unit]}</span>` : ""}
+          </div>
+          ${locations}
+        </div>
+        <div class="stock-qty">
+          <strong>${escapeHtml(availableDisplay.main)}</strong>
+          <span>${availableDisplay.secondary ? `${escapeHtml(availableDisplay.secondary)} · ` : ""}${snapshot.reservedQuantity > 0 ? `${escapeHtml(physicalDisplay.main)} physique · ${escapeHtml(reservedDisplay.main)} réservé` : "disponible"}</span>
+        </div>
+        <div class="stock-actions">
+          <button class="button secondary small" data-action="entry">+ Entrée</button>
+          <button class="button danger-soft small" data-action="exit">− Sortie</button>
+          <button class="button ghost small" data-action="transfer">⇄ Transférer</button>
+          <button class="button ghost small" data-action="reserve">Réserver</button>
+          <button class="button secondary small" data-action="replenish">Réapprovisionner</button>
+          <button class="button ghost small" data-action="incident">Autre mouvement</button>
+        </div>
+      </article>`;
+    }));
+    list.innerHTML = blocks.join("");
+    list.querySelectorAll("[data-action]").forEach(button => {
+        button.addEventListener("click", async () => {
+            const card = button.closest("[data-product-id]");
+            const productId = card?.dataset.productId;
+            const action = button.dataset.action;
+            if (!productId)
+                return;
+            if (action === "entry" || action === "exit")
+                await openMovement(productId, action);
+            else if (action === "transfer")
+                await openTransfer(productId);
+            else if (action === "reserve")
+                await openReservation(productId);
+            else if (action === "replenish")
+                await openReplenish(productId);
+            else if (action === "incident")
+                await openIncident(productId);
+        });
+    });
+}
+async function renderAlerts() {
+    const alerts = await service.listAlerts();
+    const list = $("#alert-list");
+    if (!alerts.length) {
+        list.innerHTML = `<div class="empty"><strong>Aucune alerte</strong><span>Les ruptures, stocks faibles et écarts d'inventaire apparaîtront ici.</span></div>`;
+        return;
+    }
+    list.innerHTML = alerts.map(alert => {
+        const kind = alert.type === "OUT_OF_STOCK"
+            ? { label: "Rupture", css: "out" }
+            : alert.type === "LOW_STOCK"
+                ? { label: "Stock faible", css: "low" }
+                : { label: "Écart inventaire", css: "info" };
+        const display = stockQuantityLines(alert.item, alert.quantity);
+        const threshold = alert.threshold === null
+            ? ""
+            : ` · Seuil ${quantity(alert.threshold)} ${unitLabel(alert.item.unit, alert.threshold)}`;
+        return `<article class="alert-row">
+      <div>
+        <div class="alert-title"><strong>${escapeHtml(alert.item.name)}</strong><span class="badge ${kind.css}">${kind.label}</span></div>
+        <span>${escapeHtml(alert.message)}${threshold}${alert.type === "INVENTORY_DIFFERENCE" ? ` · ${dateLabel(alert.createdAt)}` : ""}</span>
+      </div>
+      <div class="alert-qty">${escapeHtml(display.main)}${display.secondary ? `<small>${escapeHtml(display.secondary)}</small>` : ""}</div>
+    </article>`;
+    }).join("");
+}
+async function renderAngelSupplierAnswer(query) {
+    const box = $("#angel-supplier-answer");
+    const answer = await angelSupplierService.search(query);
+    box.hidden = false;
+    if (!answer.results.length) {
+        box.innerHTML = `
+      <div class="angel-answer-head"><strong>Ángel — réponse fournisseur</strong><span class="badge neutral">Aucune correspondance</span></div>
+      <p>${escapeHtml(answer.message)}</p>
+      <small>Source : SupplierStockService · aucune lecture directe de table fournisseur.</small>
+    `;
+        return;
+    }
+    box.innerHTML = `
+    <div class="angel-answer-head"><strong>Ángel — réponse fournisseur</strong><span class="badge info">${answer.results.length} résultat${answer.results.length > 1 ? "s" : ""}</span></div>
+    <p>${escapeHtml(answer.message)}</p>
+    <div class="angel-answer-results">
+      ${answer.results.map(row => {
+        const status = supplierStatus(row.stockStatus);
+        const available = row.availableQuantity === null
+            ? "Quantité non communiquée"
+            : `${quantity(row.availableQuantity)} ${unitLabel(row.unit, row.availableQuantity)}`;
+        return `<div>
+          <strong>${escapeHtml(row.supplierName)} · réf. ${escapeHtml(row.supplierReference)}</strong>
+          <span>${escapeHtml(available)} · ${status.label} · ${escapeHtml(row.freshness)}</span>
+        </div>`;
+    }).join("")}
+    </div>
+    <small>Source : SupplierStockService · stock artisan non fusionné · aucune table fournisseur lue directement.</small>
+  `;
+}
+async function renderSuppliers() {
+    const rows = await supplierService.search(supplierSearch);
+    const list = $("#supplier-list");
+    renderSupplierDraft();
+    if (!rows.length) {
+        list.innerHTML = `<div class="empty"><strong>Aucune disponibilité fournisseur trouvée</strong><span>Essayez une autre désignation ou référence.</span></div>`;
+        return;
+    }
+    list.innerHTML = rows.map((row, index) => {
+        const status = supplierStatus(row.stockStatus);
+        const available = row.availableQuantity === null
+            ? "Quantité non communiquée"
+            : `${quantity(row.availableQuantity)} ${unitLabel(row.unit, row.availableQuantity)}`;
+        const price = row.priceHt === null ? "Prix non communiqué" : `${euro(row.priceHt)} HT / ${unitLabel(row.unit, 1)}`;
+        return `
+      <article class="supplier-card" data-supplier-index="${index}">
+        <div class="supplier-card-head">
+          <div>
+            <span class="supplier-name">${escapeHtml(row.supplierName)}</span>
+            <h3>${escapeHtml(row.designation)}</h3>
+          </div>
+          <span class="badge ${status.css}">${status.label}</span>
+        </div>
+        <div class="supplier-meta">
+          <span>Réf. ${escapeHtml(row.supplierReference)}</span>
+          <span>${escapeHtml(row.depotName ?? "Dépôt non renseigné")}</span>
+          <span>${escapeHtml(supplierFreshness(row))}</span>
+        </div>
+        <div class="supplier-availability">
+          <div><span>Disponibilité fournisseur</span><strong>${escapeHtml(available)}</strong></div>
+          <div><span>Prix</span><strong>${escapeHtml(price)}</strong></div>
+        </div>
+        <div class="supplier-actions">
+          <label>Quantité<input type="number" min="0.000001" step="any" value="1" data-supplier-quantity></label>
+          <button class="button ghost small" data-supplier-action="quote">Demander un devis</button>
+          <button class="button secondary small" data-supplier-action="order">Préparer commande</button>
+        </div>
+        ${row.isDemo ? `<div class="demo-watermark">Données de démonstration — aucune donnée ERP réelle</div>` : ""}
+      </article>
+    `;
+    }).join("");
+    list.querySelectorAll("[data-supplier-index]").forEach(card => {
+        const index = Number(card.dataset.supplierIndex ?? -1);
+        const row = rows[index];
+        if (!row)
+            return;
+        const input = card.querySelector("[data-supplier-quantity]");
+        card.querySelectorAll("[data-supplier-action]").forEach(button => {
+            button.addEventListener("click", () => {
+                try {
+                    const requested = Number(input?.value ?? 0);
+                    lastSupplierDraft = button.dataset.supplierAction === "order"
+                        ? supplierService.prepareOrderDraft(row, requested)
+                        : supplierService.prepareQuoteDraft(row, requested);
+                    renderSupplierDraft();
+                    showToast(button.dataset.supplierAction === "order"
+                        ? "Brouillon envoyé vers le futur circuit Commandes / Achats. Aucune commande réelle créée."
+                        : "Demande de devis préparée. Aucun envoi fournisseur réel.");
+                }
+                catch (error) {
+                    showToast(explainError(error), true);
+                }
+            });
+        });
+    });
+}
+async function fillExpertSelects() {
+    const [views, locations, vehicles] = await Promise.all([
+        service.listItemViews(),
+        service.listLocations(),
+        service.listVehicleStocks(),
+    ]);
+    const itemOptions = views.map(view => `<option value="${escapeHtml(view.item.id)}">${escapeHtml(view.item.name)}</option>`).join("");
+    for (const id of ["vehicle-load-product", "expert-qr-product"]) {
+        const select = document.getElementById(id);
+        if (select)
+            select.innerHTML = itemOptions;
+    }
+    const locationOptions = locations.map(location => `<option value="${escapeHtml(location.id)}">${escapeHtml(location.name)}</option>`).join("");
+    for (const id of ["expert-qr-from", "expert-qr-to"]) {
+        const select = document.getElementById(id);
+        if (select)
+            select.innerHTML = `<option value="">—</option>${locationOptions}`;
+    }
+    const vehicleSelect = document.getElementById("vehicle-load-vehicle");
+    if (vehicleSelect) {
+        vehicleSelect.innerHTML = vehicles.length
+            ? vehicles.map(vehicle => `<option value="${escapeHtml(vehicle.location.id)}">${escapeHtml(vehicle.location.name)}${vehicle.registration ? ` · ${escapeHtml(vehicle.registration)}` : ""}</option>`).join("")
+            : `<option value="">Aucun véhicule</option>`;
+    }
+    const loadProduct = document.getElementById("vehicle-load-product");
+    if (loadProduct && loadProduct.value) {
+        const view = views.find(row => row.item.id === loadProduct.value);
+        const unitSelect = document.getElementById("vehicle-load-unit");
+        if (view && unitSelect)
+            setUnitOptions(unitSelect, view.item);
+    }
+    const qrProduct = document.getElementById("expert-qr-product");
+    if (qrProduct && qrProduct.value) {
+        const view = views.find(row => row.item.id === qrProduct.value);
+        const unitSelect = document.getElementById("expert-qr-unit");
+        if (view && unitSelect)
+            setUnitOptions(unitSelect, view.item);
+    }
+}
+async function renderVehicles() {
+    const vehicles = await service.listVehicleStocks();
+    const list = $("#vehicle-stock-list");
+    if (!vehicles.length) {
+        list.innerHTML = `<div class="empty"><strong>Aucun véhicule reçu</strong><span>Synchronisez le Parc matériel SpeedArti pour afficher les véhicules actifs.</span></div>`;
+        return;
+    }
+    list.innerHTML = vehicles.map(vehicle => `
+    <article class="vehicle-card" data-vehicle-id="${escapeHtml(vehicle.location.id)}">
+      <div class="vehicle-card-head">
+        <div>
+          <strong>${escapeHtml(vehicle.location.name)}</strong>
+          <span>${vehicle.registration ? escapeHtml(vehicle.registration) : "Immatriculation non renseignée"} · ${vehicle.referenceCount} référence${vehicle.referenceCount > 1 ? "s" : ""}</span>
+        </div>
+        <span class="badge ${vehicle.reservedReferenceCount > 0 ? "low" : "good"}">${vehicle.reservedReferenceCount} réservée${vehicle.reservedReferenceCount > 1 ? "s" : ""}</span>
+      </div>
+      <div class="vehicle-lines">
+        ${vehicle.lines.length ? vehicle.lines.map(line => {
+        const display = stockQuantityLines(line.item, line.snapshot.physicalQuantity);
+        const available = stockQuantityLines(line.item, line.snapshot.availableQuantity);
+        return `<div class="vehicle-line" data-product-id="${escapeHtml(line.item.id)}">
+            <div><strong>${escapeHtml(line.item.name)}</strong><span>${escapeHtml(display.main)}${display.secondary ? ` · ${escapeHtml(display.secondary)}` : ""} · disponible ${escapeHtml(available.main)}</span></div>
+            <div class="vehicle-line-actions">
+              <button class="button ghost small" data-vehicle-action="return">Retour dépôt</button>
+              <button class="button danger-soft small" data-vehicle-action="site-exit">Sortie chantier</button>
+            </div>
+          </div>`;
+    }).join("") : `<div class="empty compact-empty"><strong>Véhicule vide</strong><span>Chargez du matériel depuis le dépôt principal.</span></div>`}
+      </div>
+    </article>
+  `).join("");
+    list.querySelectorAll("[data-vehicle-action]").forEach(button => {
+        button.addEventListener("click", async () => {
+            const line = button.closest("[data-product-id]");
+            const card = button.closest("[data-vehicle-id]");
+            const productId = line?.dataset.productId;
+            const vehicleId = card?.dataset.vehicleId;
+            if (!productId || !vehicleId)
+                return;
+            if (button.dataset.vehicleAction === "return") {
+                await openTransfer(productId);
+                const form = $("#transfer-form");
+                const depot = (await service.listLocations()).find(location => location.name === "Dépôt principal");
+                form.elements.namedItem("fromLocationId").value = vehicleId;
+                if (depot)
+                    form.elements.namedItem("toLocationId").value = depot.id;
+                form.elements.namedItem("reason").value = "Retour véhicule vers dépôt";
+            }
+            else {
+                await openMovement(productId, "exit");
+                const form = $("#movement-form");
+                form.elements.namedItem("locationId").value = vehicleId;
+                form.elements.namedItem("reason").value = "Sortie depuis véhicule pour chantier";
+            }
+        });
+    });
+}
+function scanActionLabel(action) {
+    return ({
+        SELECT_PRODUCT: "Article identifié",
+        ENTRY: "Entrée",
+        EXIT: "Sortie",
+        TRANSFER: "Transfert",
+        SITE_RETURN: "Retour chantier",
+    })[action];
+}
+function renderScanDraft(draft) {
+    const box = $("#expert-scan-result");
+    box.hidden = false;
+    const source = draft.sourceKind === "BARCODE" ? "Code-barres" : "QR SpeedArti";
+    const location = draft.action === "TRANSFER"
+        ? `${draft.locationFrom?.name ?? "?"} → ${draft.locationTo?.name ?? "?"}`
+        : draft.locationTo?.name ?? draft.locationFrom?.name ?? "À choisir";
+    box.innerHTML = `
+    <div class="scan-result-head"><div><span class="eyebrow">${source}</span><strong>${escapeHtml(draft.item.name)}</strong></div><span class="badge info">${scanActionLabel(draft.action)}</span></div>
+    <div class="scan-result-grid">
+      <span>Quantité<strong>${draft.quantity === null ? "À saisir" : `${quantity(draft.quantity)} ${unitLabel(draft.unit, draft.quantity)}`}</strong></span>
+      <span>Emplacement<strong>${escapeHtml(location)}</strong></span>
+      <span>Chantier<strong>${escapeHtml(draft.chantierId ?? "Non renseigné")}</strong></span>
+    </div>
+    <p>${escapeHtml(draft.message)}</p>
+    <div class="scan-result-actions">
+      ${draft.action === "SELECT_PRODUCT" ? `
+        <button class="button secondary small" data-scan-product-action="entry">Entrée</button>
+        <button class="button danger-soft small" data-scan-product-action="exit">Sortie</button>
+        <button class="button ghost small" data-scan-product-action="transfer">Transfert</button>
+      ` : `<button id="expert-scan-confirm" class="button primary">Confirmer l'action</button>`}
+    </div>
+    <small>Validation humaine obligatoire : le scan seul ne modifie jamais le Stock.</small>
+  `;
+    box.querySelectorAll("[data-scan-product-action]").forEach(button => {
+        button.addEventListener("click", async () => {
+            const action = button.dataset.scanProductAction;
+            if (action === "entry" || action === "exit")
+                await openMovement(draft.item.id, action);
+            else
+                await openTransfer(draft.item.id);
+        });
+    });
+    const confirm = box.querySelector("#expert-scan-confirm");
+    confirm?.addEventListener("click", async () => {
+        try {
+            await expertScanService.confirm(draft, true);
+            currentScanDraft = null;
+            box.innerHTML = `<div class="success-box"><strong>Action confirmée</strong><span>Le mouvement a été enregistré et tracé.</span></div>`;
+            showToast("Mouvement Stock confirmé après scan.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+}
+async function analyzeExpertCode(raw) {
+    currentScanDraft = await expertScanService.resolve(raw);
+    renderScanDraft(currentScanDraft);
+}
+function stopExpertCamera() {
+    expertCameraFrame += 1;
+    expertCameraStream?.getTracks().forEach(track => track.stop());
+    expertCameraStream = null;
+    const wrap = document.getElementById("expert-camera-wrap");
+    const video = document.getElementById("expert-camera-video");
+    if (video)
+        video.srcObject = null;
+    if (wrap)
+        wrap.hidden = true;
+    const stop = document.getElementById("expert-camera-stop");
+    if (stop)
+        stop.hidden = true;
+}
+async function startExpertCamera() {
+    const BarcodeDetectorCtor = window.BarcodeDetector;
+    if (!BarcodeDetectorCtor || !navigator.mediaDevices?.getUserMedia) {
+        showToast("Le scan caméra natif n'est pas disponible sur ce navigateur. Utilisez un lecteur code-barres ou collez le code.", true);
+        return;
+    }
+    stopExpertCamera();
+    const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
+    });
+    expertCameraStream = stream;
+    const video = $("#expert-camera-video");
+    const wrap = $("#expert-camera-wrap");
+    const stop = $("#expert-camera-stop");
+    video.srcObject = stream;
+    wrap.hidden = false;
+    stop.hidden = false;
+    await video.play();
+    const detector = new BarcodeDetectorCtor({ formats: ["qr_code", "ean_13", "ean_8", "code_128"] });
+    const frameId = ++expertCameraFrame;
+    const loop = async () => {
+        if (frameId !== expertCameraFrame || !expertCameraStream)
+            return;
+        try {
+            const results = await detector.detect(video);
+            const raw = results.find(result => result.rawValue)?.rawValue?.trim();
+            if (raw) {
+                const input = $("#expert-scan-input");
+                input.value = raw;
+                stopExpertCamera();
+                await analyzeExpertCode(raw);
+                return;
+            }
+        }
+        catch {
+            // La caméra continue : une frame illisible n'est pas une erreur métier.
+        }
+        window.setTimeout(() => { void loop(); }, 250);
+    };
+    await loop();
+}
+async function renderHistory() {
+    const rows = await service.movementHistory();
+    const list = $("#history-list");
+    if (!rows.length) {
+        list.innerHTML = `<div class="empty"><strong>Aucun mouvement</strong><span>Les opérations de stock apparaîtront ici.</span></div>`;
+        return;
+    }
+    list.innerHTML = rows.map(({ movement, itemName, locationFromName, locationToName }) => {
+        const positive = ["ENTRY", "SITE_RETURN"].includes(movement.movementType) || (movement.movementType === "ADJUSTMENT" && movement.quantity > 0);
+        const negative = ["EXIT", "LOSS", "BREAKAGE"].includes(movement.movementType) || (movement.movementType === "ADJUSTMENT" && movement.quantity < 0);
+        const sign = positive ? "+" : negative ? "−" : "";
+        const location = movement.movementType === "TRANSFER"
+            ? `${locationFromName ?? "?"} → ${locationToName ?? "?"}`
+            : locationToName ?? locationFromName ?? "";
+        const chantier = movement.chantierId ? ` · Chantier ${escapeHtml(movement.chantierId)}` : "";
+        return `<article class="history-row">
+      <div class="history-main"><strong>${escapeHtml(itemName)} · ${MOVEMENT_LABELS[movement.movementType]}</strong>
+      <span>${escapeHtml(location)}${movement.reason ? ` · ${escapeHtml(movement.reason)}` : ""}${chantier} · ${dateLabel(movement.createdAt)}</span></div>
+      <div class="history-qty ${positive ? "entry" : negative ? "exit" : ""}">${sign}${quantity(Math.abs(movement.quantity))} ${UNIT_LABELS[movement.unit]}</div>
+    </article>`;
+    }).join("");
+}
+async function renderLocations() {
+    const locations = await service.listLocations();
+    const list = $("#location-list");
+    list.innerHTML = locations.map(location => `
+    <article class="location-row"><div><strong>${escapeHtml(location.name)}</strong><span>${escapeHtml(locationTypeLabel(location.type))}</span></div>
+    ${location.name === "Dépôt principal" ? `<span class="badge good">Par défaut</span>` : ""}</article>`).join("");
+}
+async function renderReservationsAndNeeds() {
+    const [reservations, requirements] = await Promise.all([
+        service.listActiveReservations(),
+        service.listPurchaseRequirements(),
+    ]);
+    const reservationList = $("#reservation-list");
+    if (!reservations.length) {
+        reservationList.innerHTML = `<div class="empty"><strong>Aucune réservation active</strong><span>Réservez du matériel pour un chantier depuis Mon stock.</span></div>`;
+    }
+    else {
+        reservationList.innerHTML = reservations.map(({ reservation, item, location }) => `
+      <article class="reservation-row" data-reservation-id="${escapeHtml(reservation.id)}">
+        <div>
+          <strong>${escapeHtml(item.name)}</strong>
+          <span>Chantier ${escapeHtml(reservation.chantierId ?? "non renseigné")} · ${escapeHtml(location?.name ?? "Tous emplacements")}${reservation.reason ? ` · ${escapeHtml(reservation.reason)}` : ""} · ${dateLabel(reservation.createdAt)}</span>
+        </div>
+        <div class="reservation-qty">${quantity(reservation.quantity)} ${UNIT_LABELS[item.unit]}</div>
+        <button class="button ghost small" data-release>Libérer</button>
+      </article>
+    `).join("");
+        reservationList.querySelectorAll("[data-release]").forEach(button => {
+            button.addEventListener("click", async () => {
+                const row = button.closest("[data-reservation-id]");
+                const reservationId = row?.dataset.reservationId;
+                if (!reservationId)
+                    return;
+                try {
+                    await service.releaseReservation(reservationId);
+                    showToast("Réservation libérée.");
+                    await refresh();
+                }
+                catch (error) {
+                    showToast(explainError(error), true);
+                }
+            });
+        });
+    }
+    const requirementList = $("#requirement-list");
+    if (!requirements.length) {
+        requirementList.innerHTML = `<div class="empty"><strong>Aucun besoin d'achat préparé</strong><span>Le Stock prépare un besoin, mais ne crée jamais lui-même une commande fournisseur.</span></div>`;
+    }
+    else {
+        requirementList.innerHTML = requirements.map(({ requirement, item, location }) => `
+      <article class="requirement-row">
+        <div>
+          <strong>${escapeHtml(item.name)}</strong>
+          <span>${escapeHtml(location?.name ?? "Emplacement non défini")}${requirement.chantierId ? ` · Chantier ${escapeHtml(requirement.chantierId)}` : ""}${requirement.reason ? ` · ${escapeHtml(requirement.reason)}` : ""}</span>
+        </div>
+        <div class="requirement-qty">${quantity(requirement.quantity)} ${UNIT_LABELS[item.unit]}</div>
+        <span class="badge low">Brouillon Commandes</span>
+      </article>
+    `).join("");
+    }
+}
+async function renderInventorySession() {
+    const startArea = $("#inventory-start-area");
+    const sessionArea = $("#inventory-session-area");
+    const summary = $("#inventory-session-summary");
+    const list = $("#inventory-session-list");
+    const completeButton = $("#inventory-complete-button");
+    const validateButton = $("#inventory-validate-button");
+    if (!currentInventorySessionId) {
+        const sessions = await service.listInventorySessions();
+        const resumable = sessions.find(session => session.status === "OPEN")
+            ?? sessions.find(session => session.status === "COMPLETED");
+        currentInventorySessionId = resumable?.id ?? null;
+    }
+    if (!currentInventorySessionId) {
+        startArea.hidden = false;
+        sessionArea.hidden = true;
+        return;
+    }
+    const session = await service.getInventorySession(currentInventorySessionId);
+    const views = await service.listItemViews();
+    const itemMap = new Map(views.map(view => [view.item.id, view.item]));
+    const counted = session.counts.filter(row => row.countedQuantity !== null).length;
+    const differences = session.counts.filter(row => row.countedQuantity !== null && Math.abs(row.countedQuantity - row.theoreticalQuantity) > 1e-9).length;
+    const statusLabel = session.status === "OPEN"
+        ? "En cours"
+        : session.status === "COMPLETED"
+            ? "Comptage terminé — corrections non appliquées"
+            : "Validé";
+    startArea.hidden = session.status !== "VALIDATED";
+    sessionArea.hidden = false;
+    summary.innerHTML = `
+    <div><strong>${escapeHtml(session.locationName)}</strong><span>Démarré le ${dateLabel(session.createdAt)}</span></div>
+    <div class="inventory-session-kpis">
+      <span><strong>${counted}/${session.counts.length}</strong> comptés</span>
+      <span><strong>${differences}</strong> écart${differences > 1 ? "s" : ""}</span>
+      <span class="badge ${session.status === "OPEN" ? "info" : session.status === "COMPLETED" ? "low" : "good"}">${statusLabel}</span>
+    </div>
+  `;
+    list.innerHTML = session.counts.map(row => {
+        const item = itemMap.get(row.productId);
+        const name = item?.name ?? "Article indisponible";
+        const unit = item?.unit ?? row.unit;
+        const value = row.countedQuantity === null ? "" : String(row.countedQuantity);
+        const difference = row.countedQuantity === null ? null : row.countedQuantity - row.theoreticalQuantity;
+        return `
+      <article class="inventory-row inventory-session-row" data-product-id="${escapeHtml(row.productId)}">
+        <div class="inventory-main"><strong>${escapeHtml(name)}</strong><span>Snapshot du ${dateLabel(session.createdAt)}</span></div>
+        <div class="inventory-theoretical"><span>Théorique figé</span><strong>${quantity(row.theoreticalQuantity)} ${unitLabel(unit, row.theoreticalQuantity)}</strong></div>
+        <label class="inventory-count">Compté
+          <input type="number" min="0" step="any" value="${escapeHtml(value)}" data-counted ${session.status !== "OPEN" ? "disabled" : ""}>
+        </label>
+        <div class="inventory-difference ${difference !== null && difference > 0 ? "positive" : difference !== null && difference < 0 ? "negative" : ""}" data-difference>
+          ${difference === null ? "À compter" : `Écart : ${difference > 0 ? "+" : ""}${quantity(difference)} ${unitLabel(unit, difference)}`}
+        </div>
+      </article>
+    `;
+    }).join("");
+    if (session.status === "OPEN") {
+        list.querySelectorAll(".inventory-session-row").forEach(row => {
+            const productId = row.dataset.productId ?? "";
+            const input = row.querySelector("[data-counted]");
+            if (!input)
+                return;
+            input.addEventListener("change", async () => {
+                try {
+                    if (input.value.trim() === "")
+                        return;
+                    await service.saveInventorySessionCount(session.id, productId, Number(input.value));
+                    await renderInventorySession();
+                }
+                catch (error) {
+                    showToast(explainError(error), true);
+                }
+            });
+        });
+    }
+    completeButton.hidden = session.status !== "OPEN";
+    validateButton.hidden = session.status !== "COMPLETED";
+}
+async function openInventoryManager() {
+    await fillLocationSelects();
+    currentInventorySessionId = null;
+    const sessions = await service.listInventorySessions();
+    const resumable = sessions.find(session => session.status === "OPEN")
+        ?? sessions.find(session => session.status === "COMPLETED");
+    currentInventorySessionId = resumable?.id ?? null;
+    await renderInventorySession();
+    openDialog("inventory-dialog");
+}
+async function refresh() {
+    await fillLocationSelects();
+    await fillConnectedReferenceSelects();
+    await fillExpertSelects();
+    await Promise.all([renderDashboard(), renderStock(), renderAlerts(), renderSuppliers(), renderHistory(), renderLocations(), renderReservationsAndNeeds(), renderVehicles()]);
+    if (document.getElementById("inventory-dialog")?.open) {
+        await renderInventorySession();
+    }
+}
+function updateMovementDestinationFields() {
+    const type = $("#movement-destination-type").value;
+    const chantierField = $("#movement-chantier-field");
+    const crewField = $("#movement-crew-field");
+    chantierField.hidden = type !== "chantier";
+    crewField.hidden = type !== "equipe";
+}
+async function openMovement(productId, mode) {
+    const view = (await service.listItemViews()).find(x => x.item.id === productId);
+    if (!view)
+        return;
+    const form = $("#movement-form");
+    form.elements.namedItem("productId").value = productId;
+    form.elements.namedItem("mode").value = mode;
+    form.elements.namedItem("quantity").value = "";
+    const chantier = form.elements.namedItem("chantierId");
+    const crew = form.elements.namedItem("crewId");
+    if (chantier)
+        chantier.selectedIndex = 0;
+    if (crew)
+        crew.selectedIndex = 0;
+    form.elements.namedItem("reason").value = "";
+    const destinationType = form.elements.namedItem("destinationType");
+    if (destinationType)
+        destinationType.value = "chantier";
+    const destinationFields = $("#movement-destination-fields");
+    destinationFields.hidden = mode === "entry";
+    updateMovementDestinationFields();
+    const loc = form.elements.namedItem("locationId");
+    if (view.item.mainLocationId)
+        loc.value = view.item.mainLocationId;
+    setUnitOptions(form.elements.namedItem("unit"), view.item);
+    $("#movement-title").textContent = mode === "entry" ? "Entrée de stock" : "Sortie de stock";
+    $("#movement-eyebrow").textContent = mode === "entry" ? "Réception / ajout" : "Destination du matériel";
+    $("#movement-product").textContent = `${view.item.name} — ${quantity(view.snapshot.availableQuantity)} ${UNIT_LABELS[view.item.unit]} disponibles`;
+    $("#movement-dialog").showModal();
+}
+async function openTransfer(productId) {
+    const view = (await service.listItemViews()).find(x => x.item.id === productId);
+    if (!view)
+        return;
+    const form = $("#transfer-form");
+    form.elements.namedItem("productId").value = productId;
+    form.elements.namedItem("quantity").value = "";
+    form.elements.namedItem("chantierId").value = "";
+    form.elements.namedItem("reason").value = "";
+    if (view.item.mainLocationId)
+        form.elements.namedItem("fromLocationId").value = view.item.mainLocationId;
+    setUnitOptions(form.elements.namedItem("unit"), view.item);
+    $("#transfer-product").textContent = `${view.item.name} — ${quantity(view.snapshot.availableQuantity)} ${UNIT_LABELS[view.item.unit]} disponibles au total`;
+    $("#transfer-dialog").showModal();
+}
+async function openIncident(productId) {
+    const view = (await service.listItemViews()).find(x => x.item.id === productId);
+    if (!view)
+        return;
+    const form = $("#incident-form");
+    form.elements.namedItem("productId").value = productId;
+    form.elements.namedItem("quantity").value = "";
+    form.elements.namedItem("reason").value = "";
+    form.elements.namedItem("chantierId").value = "";
+    if (view.item.mainLocationId)
+        form.elements.namedItem("locationId").value = view.item.mainLocationId;
+    setUnitOptions(form.elements.namedItem("unit"), view.item);
+    $("#incident-product").textContent = view.item.name;
+    $("#incident-dialog").showModal();
+}
+async function openReservation(productId) {
+    const view = (await service.listItemViews()).find(x => x.item.id === productId);
+    if (!view)
+        return;
+    const form = $("#reservation-form");
+    form.elements.namedItem("productId").value = productId;
+    form.elements.namedItem("quantity").value = "";
+    form.elements.namedItem("chantierId").value = "";
+    form.elements.namedItem("reason").value = "";
+    if (view.item.mainLocationId) {
+        form.elements.namedItem("locationId").value = view.item.mainLocationId;
+    }
+    setUnitOptions(form.elements.namedItem("unit"), view.item);
+    $("#reservation-product").textContent = `${view.item.name} — ${quantity(view.snapshot.availableQuantity)} ${UNIT_LABELS[view.item.unit]} disponibles`;
+    $("#reservation-dialog").showModal();
+}
+async function openReplenish(productId) {
+    const view = (await service.listItemViews()).find(x => x.item.id === productId);
+    if (!view)
+        return;
+    const form = $("#replenish-form");
+    form.elements.namedItem("productId").value = productId;
+    form.elements.namedItem("quantity").value = "";
+    form.elements.namedItem("chantierId").value = "";
+    form.elements.namedItem("reason").value = "";
+    if (view.item.mainLocationId) {
+        form.elements.namedItem("locationId").value = view.item.mainLocationId;
+    }
+    setUnitOptions(form.elements.namedItem("unit"), view.item);
+    const threshold = view.item.minimumQuantity === null
+        ? "Aucune alerte stock minimum définie."
+        : `Alerte stock minimum : ${quantity(view.item.minimumQuantity)} ${UNIT_LABELS[view.item.unit]}.`;
+    $("#replenish-product").textContent = `${view.item.name} — ${quantity(view.snapshot.availableQuantity)} ${UNIT_LABELS[view.item.unit]} disponibles. ${threshold}`;
+    $("#replenish-dialog").showModal();
+}
+function openDialog(id) { document.getElementById(id)?.showModal(); }
+function closeDialog(id) { document.getElementById(id)?.close(); }
+function wireTabs() {
+    document.querySelectorAll(".tab").forEach(button => button.addEventListener("click", () => {
+        const tab = button.dataset.tab;
+        document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+        document.querySelectorAll(".panel").forEach(x => x.classList.remove("active"));
+        button.classList.add("active");
+        document.getElementById(`${tab}-panel`)?.classList.add("active");
+    }));
+}
+function wireDialogs() {
+    document.querySelectorAll("[data-close]").forEach(button => button.addEventListener("click", () => closeDialog(button.dataset.close ?? "")));
+    $("#add-item-button").addEventListener("click", () => {
+        const form = $("#item-form");
+        clearItemFormErrors(form);
+        $("#item-name-suggestions").hidden = true;
+        updateConditionPreview(form);
+        openDialog("item-dialog");
+    });
+    $("#add-location-button").addEventListener("click", () => openDialog("location-dialog"));
+}
+function wireForms() {
+    const itemForm = $("#item-form");
+    itemForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!validateItemForm(itemForm))
+            return;
+        const data = new FormData(itemForm);
+        try {
+            const thresholdRaw = String(data.get("minimumQuantity") ?? "").trim();
+            await service.createItem({
+                name: String(data.get("name") ?? ""),
+                section: String(data.get("section") ?? "").trim() || null,
+                family: String(data.get("family") ?? ""),
+                unit: String(data.get("unit") ?? "piece"),
+                initialQuantity: Number(data.get("initialQuantity") ?? 0),
+                locationId: String(data.get("locationId") ?? ""),
+                minimumQuantity: thresholdRaw ? Number(thresholdRaw) : null,
+                internalReference: String(data.get("internalReference") ?? ""),
+                supplierReference: String(data.get("supplierReference") ?? ""),
+                barcode: String(data.get("barcode") ?? ""),
+                notes: String(data.get("notes") ?? ""),
+                secondary: secondaryDefinitionFromForm(data),
+            });
+            itemForm.reset();
+            clearItemFormErrors(itemForm);
+            $("#item-name-suggestions").hidden = true;
+            $("#secondary-mode").dispatchEvent(new Event("change"));
+            updateConditionPreview(itemForm);
+            closeDialog("item-dialog");
+            showToast("Article ajouté au stock.");
+            await refresh();
+        }
+        catch (error) {
+            mapItemDomainError(itemForm, error);
+        }
+    });
+    const movementForm = $("#movement-form");
+    movementForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(movementForm);
+        const mode = String(data.get("mode") ?? "");
+        try {
+            let chantierId = null;
+            let crewId = null;
+            let destinationLabel = "";
+            if (mode === "exit") {
+                const destinationType = String(data.get("destinationType") ?? "consommation");
+                if (destinationType === "chantier") {
+                    const chantier = referenceDirectory.requireChantier(String(data.get("chantierId") ?? ""));
+                    chantierId = chantier.chantierId;
+                    destinationLabel = `Chantier : ${chantier.name}`;
+                }
+                else if (destinationType === "equipe") {
+                    const crew = referenceDirectory.requireCrew(String(data.get("crewId") ?? ""));
+                    crewId = crew.crewId;
+                    destinationLabel = `Équipe : ${crew.name}`;
+                }
+                else {
+                    destinationLabel = "Consommé / autre sortie";
+                }
+            }
+            const reasonRaw = String(data.get("reason") ?? "").trim();
+            const input = {
+                productId: String(data.get("productId") ?? ""),
+                quantity: Number(data.get("quantity") ?? 0),
+                unit: String(data.get("unit") ?? "piece"),
+                locationId: String(data.get("locationId") ?? ""),
+                chantierId,
+                crewId,
+                reason: [destinationLabel, reasonRaw].filter(Boolean).join(" · ") || null,
+            };
+            if (mode === "entry")
+                await service.recordEntry(input);
+            else
+                await service.recordExit(input);
+            closeDialog("movement-dialog");
+            showToast(mode === "entry" ? "Entrée enregistrée." : "Sortie enregistrée avec sa destination.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    const transferForm = $("#transfer-form");
+    transferForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(transferForm);
+        try {
+            await service.transferStock({ productId: String(data.get("productId") ?? ""), quantity: Number(data.get("quantity") ?? 0), unit: String(data.get("unit") ?? "piece"), fromLocationId: String(data.get("fromLocationId") ?? ""), toLocationId: String(data.get("toLocationId") ?? ""), chantierId: String(data.get("chantierId") ?? "").trim() || null, reason: String(data.get("reason") ?? "").trim() || null });
+            closeDialog("transfer-dialog");
+            showToast("Transfert enregistré.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    const incidentForm = $("#incident-form");
+    incidentForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(incidentForm);
+        try {
+            const kind = String(data.get("kind") ?? "LOSS");
+            const input = { productId: String(data.get("productId") ?? ""), quantity: Number(data.get("quantity") ?? 0), unit: String(data.get("unit") ?? "piece"), locationId: String(data.get("locationId") ?? ""), chantierId: String(data.get("chantierId") ?? "").trim() || null, reason: String(data.get("reason") ?? "").trim() || null };
+            if (kind === "BREAKAGE")
+                await service.recordBreakage(input);
+            else if (kind === "SITE_RETURN")
+                await service.recordSiteReturn(input);
+            else
+                await service.recordLoss(input);
+            closeDialog("incident-dialog");
+            showToast("Mouvement enregistré.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    const reservationForm = $("#reservation-form");
+    reservationForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(reservationForm);
+        try {
+            await service.createReservation({
+                productId: String(data.get("productId") ?? ""),
+                quantity: Number(data.get("quantity") ?? 0),
+                unit: String(data.get("unit") ?? "piece"),
+                locationId: String(data.get("locationId") ?? ""),
+                chantierId: String(data.get("chantierId") ?? "").trim(),
+                reason: String(data.get("reason") ?? "").trim() || null,
+            });
+            closeDialog("reservation-dialog");
+            showToast("Stock réservé pour le chantier.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    const replenishForm = $("#replenish-form");
+    replenishForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(replenishForm);
+        try {
+            await service.createPurchaseRequirement({
+                productId: String(data.get("productId") ?? ""),
+                quantity: Number(data.get("quantity") ?? 0),
+                unit: String(data.get("unit") ?? "piece"),
+                locationId: String(data.get("locationId") ?? "") || null,
+                chantierId: String(data.get("chantierId") ?? "").trim() || null,
+                reason: String(data.get("reason") ?? "").trim() || null,
+            });
+            closeDialog("replenish-dialog");
+            showToast("Besoin d'achat préparé pour Commandes / Achats.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    const locationForm = $("#location-form");
+    locationForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(locationForm);
+        try {
+            await service.createLocation({ name: String(data.get("name") ?? ""), type: String(data.get("type") ?? "depot") });
+            locationForm.reset();
+            closeDialog("location-dialog");
+            showToast("Emplacement ajouté.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+}
+function wireSecondaryFields() {
+    const form = $("#item-form");
+    const mode = $("#secondary-mode");
+    const groups = Array.from(document.querySelectorAll("[data-secondary-group]"));
+    const refreshFields = () => {
+        const selected = mode.value;
+        groups.forEach(group => {
+            group.hidden = group.dataset.secondaryGroup !== selected;
+        });
+        updateConditionPreview(form);
+    };
+    mode.addEventListener("change", refreshFields);
+    form.querySelectorAll("input, select").forEach(field => {
+        field.addEventListener("input", () => updateConditionPreview(form));
+        field.addEventListener("change", () => updateConditionPreview(form));
+    });
+    refreshFields();
+}
+function wireItemNameAutocomplete() {
+    const input = $("#item-name-input");
+    const suggestions = $("#item-name-suggestions");
+    input.addEventListener("input", () => {
+        void renderNameSuggestions(input.value);
+        if (input.value.trim()) {
+            input.classList.remove("field-invalid");
+            input.removeAttribute("aria-invalid");
+            input.parentElement?.querySelector(".field-error-message")?.remove();
+        }
+    });
+    input.addEventListener("focus", () => {
+        if (input.value.trim().length >= 2)
+            void renderNameSuggestions(input.value);
+    });
+    document.addEventListener("click", event => {
+        const target = event.target;
+        if (!input.contains(target) && !suggestions.contains(target))
+            suggestions.hidden = true;
+    });
+}
+function wireDemoData() {
+    const button = document.getElementById("load-demo-button");
+    if (!button)
+        return;
+    button.addEventListener("click", async () => {
+        try {
+            button.disabled = true;
+            await loadBtpDemoData(service);
+            showToast("Exemples BTP chargés.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+        finally {
+            button.disabled = false;
+        }
+    });
+}
+function wireAngelSupplier() {
+    const form = $("#angel-supplier-form");
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(form);
+        const query = String(data.get("query") ?? "").trim();
+        if (!query) {
+            showToast("Saisissez une question ou un produit à rechercher.", true);
+            return;
+        }
+        try {
+            await renderAngelSupplierAnswer(query);
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+}
+function wireSupplierSearch() {
+    const input = $("#supplier-search-input");
+    input.addEventListener("input", async () => {
+        supplierSearch = input.value;
+        await renderSuppliers();
+    });
+}
+function wireExpert() {
+    const scanForm = $("#expert-scan-form");
+    scanForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(scanForm);
+        try {
+            await analyzeExpertCode(String(data.get("code") ?? ""));
+        }
+        catch (error) {
+            currentScanDraft = null;
+            showToast(explainError(error), true);
+        }
+    });
+    $("#expert-camera-button").addEventListener("click", () => {
+        void startExpertCamera().catch(error => showToast(explainError(error), true));
+    });
+    $("#expert-camera-stop").addEventListener("click", () => stopExpertCamera());
+    $("#sync-demo-vehicles-button").addEventListener("click", async () => {
+        try {
+            await service.syncVehicleFromParcMateriel({
+                vehicleId: "parc-demo-camion-couvreur",
+                name: "Camion couvreur — démo Parc matériel",
+                registration: "DEMO-G2-31",
+                active: true,
+            });
+            showToast("Véhicule fictif reçu depuis le connecteur Parc matériel.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    const loadForm = $("#vehicle-load-form");
+    const loadProduct = $("#vehicle-load-product");
+    loadProduct.addEventListener("change", async () => {
+        const view = (await service.listItemViews()).find(row => row.item.id === loadProduct.value);
+        if (view)
+            setUnitOptions($("#vehicle-load-unit"), view.item);
+    });
+    loadForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(loadForm);
+        try {
+            const depot = (await service.listLocations()).find(location => location.name === "Dépôt principal");
+            if (!depot)
+                throw new StockDomainError("LOCATION_NOT_FOUND", "Dépôt principal introuvable.");
+            const vehicleLocationId = String(data.get("vehicleId") ?? "");
+            if (!vehicleLocationId) {
+                throw new StockDomainError("LOCATION_NOT_FOUND", "Aucun véhicule actif n'a été reçu du Parc matériel.");
+            }
+            await service.transferStock({
+                productId: String(data.get("productId") ?? ""),
+                quantity: Number(data.get("quantity") ?? 0),
+                unit: String(data.get("unit") ?? "piece"),
+                fromLocationId: depot.id,
+                toLocationId: vehicleLocationId,
+                reason: "Chargement véhicule depuis Parc matériel",
+            });
+            showToast("Chargement validé : dépôt déduit et véhicule alimenté.");
+            await refresh();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+}
+function wireSearch() {
+    const input = $("#search-input");
+    input.addEventListener("input", async () => { search = input.value; await renderStock(); });
+}
+function wireInventory() {
+    const open = () => { void openInventoryManager().catch(error => showToast(explainError(error), true)); };
+    $("#create-inventory-button").addEventListener("click", open);
+    $("#create-inventory-inline-button").addEventListener("click", open);
+    const startForm = $("#inventory-start-form");
+    startForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const data = new FormData(startForm);
+        try {
+            const session = await service.startInventorySession(String(data.get("locationId") ?? ""));
+            currentInventorySessionId = session.id;
+            await renderInventorySession();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    $("#inventory-complete-button").addEventListener("click", async () => {
+        if (!currentInventorySessionId)
+            return;
+        try {
+            await service.completeInventorySession(currentInventorySessionId);
+            showToast("Inventaire terminé. Aucune correction n'a encore été appliquée.");
+            await renderInventorySession();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+    $("#inventory-validate-button").addEventListener("click", async () => {
+        if (!currentInventorySessionId)
+            return;
+        try {
+            const result = await service.validateInventoryAdjustments(currentInventorySessionId);
+            showToast(result.movements.length
+                ? `${result.movements.length} correction(s) ADJUSTMENT appliquée(s).`
+                : "Inventaire validé sans écart.");
+            currentInventorySessionId = null;
+            await refresh();
+            await renderInventorySession();
+        }
+        catch (error) {
+            showToast(explainError(error), true);
+        }
+    });
+}
+function wireMovementDestination() {
+    $("#movement-destination-type").addEventListener("change", updateMovementDestinationFields);
+    updateMovementDestinationFields();
+}
+async function main() { wireTabs(); wireDialogs(); wireForms(); wireSecondaryFields(); wireItemNameAutocomplete(); wireDemoData(); wireAngelSupplier(); wireSupplierSearch(); wireExpert(); wireSearch(); wireInventory(); wireMovementDestination(); await service.initialize(); await refresh(); }
+main().catch(error => { showToast(explainError(error), true); console.error(error); });
